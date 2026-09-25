@@ -1,0 +1,13 @@
+# 编译中间产物
+bin/*.o
+
+# 运行日志与自测报告
+bin/*.log
+bin/logi-tray-selftest.txt
+
+# 开发工具编译产物
+tools/*.exe
+tools/*_out.txt
+
+# 已被 bin/logi-tray.exe 取代的旧独立验证程序
+bin/logi-tray-selftest.exe
