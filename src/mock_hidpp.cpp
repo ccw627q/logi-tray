@@ -21,6 +21,11 @@ struct SimDevice {
     BYTE status;           // Logi::BATTERY_STATUS_*
     bool sleeps;           // stops answering after SleepyAfterMs()
     BYTE nameIndex;
+    // How the device refuses a feature it does not have. Real hardware does
+    // both: some answer ROOT.GetFeature with index 0 (wired mice such as the
+    // G502), others send an error frame. Covering both keeps the self-test
+    // honest about the "device is here but has no battery" case.
+    bool absentAsZero;
 };
 
 static const BYTE NAME_INDEX = 0x06;
@@ -29,18 +34,18 @@ static const BYTE NAME_INDEX = 0x06;
 // three paired slots, one of which has no battery feature and one of which is
 // empty.
 static const SimDevice RX0[] = {
-    { 0xFF, L"G304 Lightspeed", 0x1004, 0x08, 87, 0x08, 0, false, NAME_INDEX },
-    { 0x01, L"MX Master 3S",    0x1004, 0x05, 55, 0x04, 1, false, NAME_INDEX },
-    { 0x02, L"MX Keys S",       0x1000, 0x03, 72, 0x00, 0, false, NAME_INDEX },
-    { 0x03, L"Logi Demo Keys",  0x0000, 0x00,  0, 0x00, 0, false, NAME_INDEX },
+    { 0xFF, L"G304 Lightspeed", 0x1004, 0x08, 87, 0x08, 0, false, NAME_INDEX, false },
+    { 0x01, L"MX Master 3S",    0x1004, 0x05, 55, 0x04, 1, false, NAME_INDEX, false },
+    { 0x02, L"MX Keys S",       0x1000, 0x03, 72, 0x00, 0, false, NAME_INDEX, true  },
+    { 0x03, L"Logi Demo Keys",  0x0000, 0x00,  0, 0x00, 0, false, NAME_INDEX, true  },
 };
 
 // Receiver 1 mimics a Unifying receiver: a low-battery mouse, a keyboard that
 // only reports a coarse level, and a device that falls asleep.
 static const SimDevice RX1[] = {
-    { 0x01, L"M720 Triathlon", 0x1004, 0x02, 12, 0x02, 0, false, NAME_INDEX },
-    { 0x02, L"K380 Keyboard",  0x1004, 0x04,  0, 0x04, 0, false, NAME_INDEX },
-    { 0x03, L"MX Anywhere 3",  0x1004, 0x07, 64, 0x04, 0, true,  NAME_INDEX },
+    { 0x01, L"M720 Triathlon", 0x1004, 0x02, 12, 0x02, 0, false, NAME_INDEX, false },
+    { 0x02, L"K380 Keyboard",  0x1004, 0x04,  0, 0x04, 0, false, NAME_INDEX, false },
+    { 0x03, L"MX Anywhere 3",  0x1004, 0x07, 64, 0x04, 0, true,  NAME_INDEX, false },
 };
 
 struct SimReceiver {
@@ -205,7 +210,7 @@ Logi::Outcome Request(HANDLE h, BYTE devNumber, BYTE reqHi, BYTE reqLo,
         if (paramLen < 2) return Unsupported(reply, devNumber, reqHi, reqLo);
         WORD feature = (WORD)((params[0] << 8) | params[1]);
         BYTE idx = FeatureIndexOf(*d, feature);
-        if (idx == 0) return Unsupported(reply, devNumber, reqHi, reqLo);
+        if (idx == 0 && !d->absentAsZero) return Unsupported(reply, devNumber, reqHi, reqLo);
         BYTE p[6] = { 0x00, reqLo, idx, 0x00, 0x00, 0x00 };
         SetReply(reply, devNumber, p, 6);
         return Logi::OUTCOME_ANSWER;

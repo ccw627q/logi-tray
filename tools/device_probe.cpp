@@ -178,6 +178,33 @@ static void ProbeInterface(const WCHAR* path) {
         } else {
             printf("    NO battery feature found!\n");
         }
+        // Dump the raw ROOT.getFeature replies for the features we care about.
+        // This runs even when no battery feature was found: "answered with
+        // index 0" and "did not answer at all" look identical from the outside
+        // and must be told apart, because only the latter means offline.
+        {
+            Logi::DeviceGroup g;
+            Logi::GroupAddHandle(g, h);
+            const WORD lookups[] = { 0x1004, 0x1000, 0x0005, 0x1B04 };
+            for (WORD feat : lookups) {
+                BYTE params[2] = { (BYTE)(feat >> 8), (BYTE)(feat & 0xFF) };
+                Logi::HidppReply rr;
+                Logi::Outcome out = Logi::GroupRequest(g, foundDev, 0x00, 0x00, params, 2, rr, 500);
+                const char* tag = (out == Logi::OUTCOME_ANSWER) ? "ANSWER" :
+                                  (out == Logi::OUTCOME_NEGATIVE_ACK) ? "NEGATIVE_ACK" :
+                                  (out == Logi::OUTCOME_TIMEOUT) ? "TIMEOUT" :
+                                  (out == Logi::OUTCOME_WRITE_FAIL) ? "WRITE_FAIL" : "NONE";
+                printf("    lookup %04X: %-12s", feat, tag);
+                if (out == Logi::OUTCOME_ANSWER || out == Logi::OUTCOME_NEGATIVE_ACK) {
+                    printf(" rid=%02X dev=%02X payload=", rr.reportId, rr.devNumber);
+                    PrintHex(rr.payload, rr.payloadLen);
+                    if (out == Logi::OUTCOME_ANSWER) printf(" -> idx=%u", rr.payload[2]);
+                }
+                printf("\n");
+                Sleep(50);
+            }
+        }
+
         if (idx != 0) {
             int level = -1;
             bool charging = false;
@@ -185,22 +212,6 @@ static void ProbeInterface(const WCHAR* path) {
                 printf("    battery: %d%% %s\n", level, charging ? "charging" : "discharging");
             } else {
                 printf("    battery read FAILED\n");
-            }
-            // dump raw root feature table lookups to identify the battery feature
-            {
-                const WORD lookups[] = { 0x1004, 0x1000, 0x0005, 0x1B04 };
-                for (WORD feat : lookups) {
-                    BYTE params[2] = { (BYTE)(feat >> 8), (BYTE)(feat & 0xFF) };
-                    Logi::HidppReply rr;
-                    if (Logi::FeatureRequest(h, foundDev, 0x00, 0x00, params, 2, rr, 500)) {
-                        printf("    root lookup %04X: rid=%02X dev=%02X payload=", feat, rr.reportId, rr.devNumber);
-                        PrintHex(rr.payload, rr.payloadLen);
-                        printf("  -> idx=%u\n", rr.payload[2]);
-                    } else {
-                        printf("    root lookup %04X FAILED\n", feat);
-                    }
-                    Sleep(50);
-                }
             }
             // step-by-step decode of ReadBattery's two requests
             Logi::HidppReply r10, r00;
@@ -240,7 +251,151 @@ static void ProbeInterface(const WCHAR* path) {
     CloseHandle(h);
 }
 
+// ---------------------------------------------------------------------------
+// Stress mode: repeat the exact requests the app issues, on the same merged
+// group the app builds, so intermittent presence failures can be reproduced.
+// ---------------------------------------------------------------------------
+
+static const char* Tag(Logi::Outcome o) {
+    switch (o) {
+        case Logi::OUTCOME_ANSWER:       return "ANSWER";
+        case Logi::OUTCOME_NEGATIVE_ACK: return "NEGATIVE_ACK";
+        case Logi::OUTCOME_TIMEOUT:      return "TIMEOUT";
+        case Logi::OUTCOME_WRITE_FAIL:   return "WRITE_FAIL";
+        default:                         return "NONE";
+    }
+}
+
+// Mirrors Device::GroupKeyFromPath: interface identity with the collection
+// index stripped, so sibling collections land in one group.
+static void StressGroupKey(const WCHAR* path, WCHAR* out, int maxLen) {
+    WCHAR lower[MAX_PATH];
+    wcscpy_s(lower, MAX_PATH, path);
+    _wcslwr_s(lower, MAX_PATH);
+    const WCHAR* first = wcschr(lower + 1, L'#');
+    if (!first) { wcsncpy_s(out, maxLen, lower, _TRUNCATE); return; }
+    const WCHAR* start = first + 1;
+    const WCHAR* end = wcschr(start, L'#');
+    if (!end) end = lower + wcslen(lower);
+    const WCHAR* col = wcsstr(start, L"&col");
+    if (col && col < end) end = col;
+    size_t len = (size_t)(end - start);
+    if (len >= (size_t)maxLen) len = maxLen - 1;
+    wcsncpy_s(out, maxLen, start, len);
+    out[len] = 0;
+}
+
+struct StressGroup {
+    WCHAR key[64];
+    Logi::DeviceGroup g;
+    int open;
+};
+
+static int RunStress(int iterations) {
+    printf("=== Logitech HID++ stress (%d iterations, 1 s apart) ===\n", iterations);
+
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL,
+                                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        printf("SetupDiGetClassDevs failed err=%lu\n", GetLastError());
+        return 1;
+    }
+
+    StressGroup groups[8];
+    int nGroups = 0;
+    ZeroMemory(groups, sizeof(groups));
+
+    SP_DEVICE_INTERFACE_DATA devData = {0};
+    devData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &hidGuid, i, &devData); ++i) {
+        DWORD reqSize = 0;
+        SetupDiGetDeviceInterfaceDetailW(hDevInfo, &devData, NULL, 0, &reqSize, NULL);
+        if (reqSize == 0) continue;
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)malloc(reqSize);
+        if (!pDetail) continue;
+        pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &devData, pDetail, reqSize, NULL, NULL)) {
+            WCHAR lower[MAX_PATH];
+            wcscpy_s(lower, MAX_PATH, pDetail->DevicePath);
+            _wcslwr_s(lower, MAX_PATH);
+            if (wcsstr(lower, L"vid_046d")) {
+                WCHAR key[64] = {0};
+                StressGroupKey(pDetail->DevicePath, key, ARRAYSIZE(key));
+                StressGroup* sg = NULL;
+                for (int k = 0; k < nGroups; ++k) {
+                    if (_wcsicmp(groups[k].key, key) == 0) { sg = &groups[k]; break; }
+                }
+                if (!sg && nGroups < 8) {
+                    sg = &groups[nGroups++];
+                    ZeroMemory(sg, sizeof(StressGroup));
+                    wcsncpy_s(sg->key, ARRAYSIZE(sg->key), key, _TRUNCATE);
+                }
+                if (sg) {
+                    HANDLE h = CreateFileW(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                    if (h == INVALID_HANDLE_VALUE) {
+                        h = CreateFileW(pDetail->DevicePath, GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                        OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                    }
+                    if (h != INVALID_HANDLE_VALUE) {
+                        if (Logi::GroupAddHandle(sg->g, h)) sg->open = 1;
+                        else CloseHandle(h);
+                    }
+                }
+            }
+        }
+        free(pDetail);
+    }
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+
+    for (int k = 0; k < nGroups; ++k) {
+        if (!groups[k].open) continue;
+        if (!Logi::GroupHasWritable(groups[k].g)) {
+            wprintf(L"\n--- group %s: no writable handle, skipped\n", groups[k].key);
+            continue;
+        }
+        wprintf(L"\n--- group %s (handles=%d) ---\n", groups[k].key, groups[k].g.count);
+
+        int maj = 0, minr = 0;
+        if (Logi::GroupPing(groups[k].g, 0xFF, maj, minr, 400) != Logi::OUTCOME_ANSWER) {
+            wprintf(L"  no device at 0xFF, skipped\n");
+            continue;
+        }
+
+        int pingOk = 0, featAnswered = 0;
+        for (int i = 0; i < iterations; ++i) {
+            int pmaj = 0, pmin = 0;
+            Logi::Outcome po = Logi::GroupPing(groups[k].g, 0xFF, pmaj, pmin, 400);
+            BYTE idx = 0;
+            Logi::Outcome fo = Logi::GroupGetFeatureInfo(groups[k].g, 0xFF, 0x1004, idx, 500);
+            if (po == Logi::OUTCOME_ANSWER) pingOk++;
+            if (fo == Logi::OUTCOME_ANSWER || fo == Logi::OUTCOME_NEGATIVE_ACK) featAnswered++;
+            printf("  #%02d ping=%-13s feat=%-13s idx=%u\n", i, Tag(po), Tag(fo), idx);
+            fflush(stdout);
+            Sleep(1000);
+        }
+        printf("  => ping answered %d/%d, feature lookup answered %d/%d\n",
+               pingOk, iterations, featAnswered, iterations);
+    }
+
+    for (int k = 0; k < nGroups; ++k) {
+        if (groups[k].open) Logi::CloseGroup(groups[k].g);
+    }
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--stress") == 0) {
+        int n = (argc >= 3) ? _wtoi(argv[2]) : 20;
+        if (n <= 0) n = 20;
+        return RunStress(n);
+    }
+
     printf("=== Logitech HID++ probe ===\n");
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);

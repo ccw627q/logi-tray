@@ -442,6 +442,17 @@ static void RediscoverAll() {
 // Polling
 // ---------------------------------------------------------------------------
 
+// True when the device replied to a feature lookup at all: with an index, with
+// index 0 ("this device has no such feature"), or with an error frame.
+static bool LookupAnswered(Logi::Outcome o) {
+    return o == Logi::OUTCOME_ANSWER || o == Logi::OUTCOME_NEGATIVE_ACK;
+}
+
+static bool DevicePresent(Logi::DeviceGroup& g, BYTE devNumber) {
+    int major = 0, minor = 0;
+    return Logi::GroupPing(g, devNumber, major, minor, 400) == Logi::OUTCOME_ANSWER;
+}
+
 // Resolve the battery feature once, then read the level.
 // Returns false when the device did not answer at all.
 static bool PollDev(KnownDev& d) {
@@ -462,11 +473,18 @@ static bool PollDev(KnownDev& d) {
                 d.batteryFeatureId = Logi::FEATURE_BATTERY_LEVEL_STATUS;
                 d.batteryFeatureIndex = idx2;
                 d.featuresResolved = true;
-            } else if (o1 == Logi::OUTCOME_NEGATIVE_ACK || o2 == Logi::OUTCOME_NEGATIVE_ACK) {
-                // Device answers but exposes no battery feature at all.
+            } else if (LookupAnswered(o1) && LookupAnswered(o2)) {
+                // The device replied to both lookups yet exposes no battery
+                // feature. Wired mice land here: they answer ROOT.GetFeature
+                // with index 0 ("no such feature") instead of an error frame,
+                // which used to be mistaken for an unreachable device.
                 d.featuresResolved = true;
                 d.noBatteryFeature = true;
                 d.state.batteryReadable = false;
+            } else if (LookupAnswered(o1) || LookupAnswered(o2)) {
+                // Partly answered: the link is alive, but the battery question
+                // is still open, so retry the lookup on the next poll.
+                return true;
             } else {
                 return false;
             }
@@ -477,7 +495,11 @@ static bool PollDev(KnownDev& d) {
                  d.batteryFeatureId, d.batteryFeatureIndex, d.noBatteryFeature ? 0 : 1);
     }
 
-    if (d.noBatteryFeature) return true;
+    if (d.noBatteryFeature) {
+        // Nothing to read. Keep verifying the link so that unplugging a
+        // battery-less device still flips it offline.
+        return DevicePresent(g->group, d.devNumber);
+    }
 
     int level = -1;
     bool charging = false;
